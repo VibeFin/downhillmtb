@@ -59,6 +59,18 @@ export function createInput(ctx) {
     // Never leave a key stuck on when focus leaves the window.
     down.clear();
     pressedEdge.clear();
+    touch.steerX = 0; touch.steerY = 0;
+    touch.brakeF = false; touch.brakeR = false;
+    touch.pedal = false; touch.pump = false; touch.manual = false;
+    touch.rollL = false; touch.rollR = false; touch.active = false;
+    touch.reset = false; touch.pause = false; touch.cameraCycle = false; touch.photoMode = false;
+    stickPointerId = -1;
+    heldPointers.clear();
+    if (touchRoot) {
+      const held = touchRoot.querySelectorAll('.held');
+      for (let i = 0; i < held.length; i++) held[i].classList.remove('held');
+    }
+    setKnob(0, 0);
   }
   function onGamepadConnected(e) {
     gamepadIndex = e.gamepad.index;
@@ -66,6 +78,296 @@ export function createInput(ctx) {
   function onGamepadDisconnected(e) {
     if (gamepadIndex === e.gamepad.index) gamepadIndex = -1;
   }
+
+  // ---- touch controls (mobile) ------------------------------------------
+  // A DOM overlay built once: left thumb-stick (steer + pitch), right action
+  // cluster (brakes / pedal / pump / manual / roll), top-right system keys.
+  // Shown only on touch-capable devices so desktop screenshots and QA are
+  // unaffected. All targets merge into the same keyboard/gamepad targets in
+  // update() — consumers keep reading ctx.input.state unchanged.
+  const TOUCH_CSS = `
+  #dsc-touch { position: fixed; inset: 0; z-index: 40; pointer-events: none;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    display: none; contain: layout style; }
+  #dsc-touch.on { display: block; }
+  #dsc-touch .tk-stick { position: absolute; pointer-events: auto; touch-action: none;
+    left: calc(18px + env(safe-area-inset-left, 0px));
+    bottom: calc(86px + env(safe-area-inset-bottom, 0px));
+    width: 128px; height: 128px; border-radius: 999px;
+    background: rgba(5,9,14,0.42); box-shadow: inset 0 0 0 1px rgba(226,240,252,0.18);
+    backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
+  #dsc-touch .tk-knob { position: absolute; left: 50%; top: 50%;
+    width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 999px;
+    background: radial-gradient(circle at 35% 30%, rgba(255,255,255,0.85), rgba(214,228,242,0.55) 60%, rgba(125,238,255,0.55));
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5); will-change: transform; }
+  #dsc-touch .tk-lbl { position: absolute; left: 0; right: 0; bottom: -18px; text-align: center;
+    font-size: 9px; font-weight: 700; letter-spacing: 0.22em; color: rgba(214,228,242,0.5); }
+  #dsc-touch .tk-cluster { position: absolute; pointer-events: none;
+    right: calc(14px + env(safe-area-inset-right, 0px));
+    bottom: calc(86px + env(safe-area-inset-bottom, 0px));
+    display: grid; grid-template-columns: repeat(2, 68px); gap: 10px; }
+  #dsc-touch .tk-btn { pointer-events: auto; touch-action: none;
+    width: 68px; height: 68px; border-radius: 999px; border: 1px solid rgba(226,240,252,0.20);
+    background: rgba(5,9,14,0.46); color: rgba(242,247,252,0.92);
+    font-size: 10px; font-weight: 800; letter-spacing: 0.08em;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+    backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
+  #dsc-touch .tk-btn small { font-size: 8px; font-weight: 600; letter-spacing: 0.14em; color: rgba(214,228,242,0.55); }
+  #dsc-touch .tk-btn.hot { border-color: rgba(255,106,43,0.65); }
+  #dsc-touch .tk-btn.acc { border-color: rgba(125,238,255,0.55); }
+  #dsc-touch .tk-btn.held { background: rgba(125,238,255,0.28); border-color: rgba(125,238,255,0.9); }
+  #dsc-touch .tk-btn.hot.held { background: rgba(255,106,43,0.32); border-color: rgba(255,106,43,0.95); }
+  #dsc-touch .tk-mini-row { position: absolute; pointer-events: none;
+    right: calc(14px + env(safe-area-inset-right, 0px));
+    bottom: calc(86px + env(safe-area-inset-bottom, 0px) + 156px);
+    display: flex; gap: 8px; }
+  #dsc-touch .tk-mini { pointer-events: auto; touch-action: none;
+    min-width: 52px; height: 34px; padding: 0 10px; border-radius: 8px;
+    border: 1px solid rgba(226,240,252,0.20); background: rgba(5,9,14,0.46);
+    color: rgba(242,247,252,0.9); font-size: 10px; font-weight: 800; letter-spacing: 0.1em; }
+  #dsc-touch .tk-mini.held { background: rgba(125,238,255,0.28); border-color: rgba(125,238,255,0.9); }
+  #dsc-touch .tk-sys { position: absolute; pointer-events: none;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px)); display: flex; gap: 8px; }
+  #dsc-touch .tk-sys button { pointer-events: auto; touch-action: none;
+    min-width: 44px; height: 36px; padding: 0 10px; border-radius: 8px;
+    border: 1px solid rgba(226,240,252,0.20); background: rgba(5,9,14,0.46);
+    color: rgba(242,247,252,0.9); font-size: 11px; font-weight: 800; }
+  @media (orientation: portrait) {
+    #dsc-touch .tk-stick { width: 112px; height: 112px; bottom: calc(120px + env(safe-area-inset-bottom, 0px)); }
+    #dsc-touch .tk-cluster { grid-template-columns: repeat(2, 62px); }
+    #dsc-touch .tk-btn { width: 62px; height: 62px; }
+  }
+  @media (prefers-reduced-motion: reduce) { #dsc-touch .tk-knob { will-change: auto; } }
+  `;
+
+  const touch = {
+    steerX: 0, steerY: 0,           // stick -1..1 (y: + = up on screen)
+    brakeF: false, brakeR: false,
+    pedal: false, pump: false, manual: false,
+    rollL: false, rollR: false,
+    active: false,                   // any touch target currently held
+    reset: false, pause: false, cameraCycle: false, photoMode: false,
+  };
+  let touchRoot = null, touchKnob = null, touchStickEl = null;
+  let touchSeen = false;             // a real touch event has fired
+  let stickPointerId = -1;
+  let stickRadius = 44;
+  const heldPointers = new Set();    // pointerIds currently down on any control
+
+  function touchForceParam() {
+    try {
+      const p = new URLSearchParams(location.search).get('touch');
+      if (p === '1') return true;
+      if (p === '0') return false;
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  const touchForced = touchForceParam();
+
+  function touchShouldShow() {
+    if (touchForced === true) return true;
+    if (touchForced === false) return false;
+    if (touchSeen) return true;
+    try {
+      if (navigator.maxTouchPoints > 0) return true;
+      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
+      if ('ontouchstart' in window) return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  function touchRefreshVisibility() {
+    if (!touchRoot) return;
+    touchRoot.classList.toggle('on', touchShouldShow());
+  }
+
+  function markTouchSeen() {
+    if (!touchSeen) { touchSeen = true; touchRefreshVisibility(); }
+  }
+
+  function setKnob(dx, dy) {
+    if (!touchKnob) return;
+    touchKnob.style.transform = `translate3d(${dx.toFixed(1)}px,${dy.toFixed(1)}px,0)`;
+  }
+
+  function stickSetFromEvent(e) {
+    if (!touchStickEl) return;
+    const r = touchStickEl.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    stickRadius = Math.max(30, r.width / 2 - 12);
+    let dx = e.clientX - cx, dy = e.clientY - cy;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len > stickRadius) { dx = dx / len * stickRadius; dy = dy / len * stickRadius; }
+    touch.steerX = dx / stickRadius;
+    touch.steerY = -dy / stickRadius;   // screen-up = pitch +1 (weight forward, like W / stick-up)
+    touch.active = true;
+    setKnob(dx, dy);
+  }
+
+  function stickRelease() {
+    stickPointerId = -1;
+    touch.steerX = 0; touch.steerY = 0;
+    setKnob(0, 0);
+    if (heldPointers.size === 0) touch.active = false;
+  }
+
+  function bindHoldButton(elm, onChange) {
+    let pid = -1;
+    const downFn = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      markTouchSeen();
+      pid = e.pointerId;
+      heldPointers.add(e.pointerId);
+      touch.active = true;
+      try { elm.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      elm.classList.add('held');
+      onChange(true);
+    };
+    const upFn = (e) => {
+      if (pid !== -1 && e.pointerId !== pid) return;
+      pid = -1;
+      heldPointers.delete(e.pointerId);
+      elm.classList.remove('held');
+      onChange(false);
+      if (heldPointers.size === 0 && stickPointerId === -1) touch.active = false;
+    };
+    elm.addEventListener('pointerdown', downFn);
+    elm.addEventListener('pointerup', upFn);
+    elm.addEventListener('pointercancel', upFn);
+    elm.addEventListener('lostpointercapture', upFn);
+    // Prevent iOS double-tap zoom / callout on long-press.
+    elm.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  function bindEdgeButton(elm, fire) {
+    elm.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      markTouchSeen();
+      touch.active = true;
+      heldPointers.add(e.pointerId);
+      setTimeout(() => heldPointers.delete(e.pointerId), 250);
+      fire();
+    });
+    elm.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  function buildTouchUI() {
+    if (touchRoot || typeof document === 'undefined') return;
+    const style = document.createElement('style');
+    style.id = 'dsc-touch-style';
+    style.textContent = TOUCH_CSS;
+    document.head.appendChild(style);
+
+    const root = document.createElement('div');
+    root.id = 'dsc-touch';
+    root.setAttribute('aria-hidden', 'true');
+
+    // Left stick.
+    const stick = document.createElement('div');
+    stick.className = 'tk-stick';
+    stick.setAttribute('aria-label', 'Steer and lean');
+    const knob = document.createElement('div');
+    knob.className = 'tk-knob';
+    stick.appendChild(knob);
+    const stickLbl = document.createElement('div');
+    stickLbl.className = 'tk-lbl';
+    stickLbl.textContent = 'STEER · LEAN';
+    stick.appendChild(stickLbl);
+    root.appendChild(stick);
+    touchStickEl = stick; touchKnob = knob;
+
+    stick.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      markTouchSeen();
+      stickPointerId = e.pointerId;
+      heldPointers.add(e.pointerId);
+      try { stick.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      stickSetFromEvent(e);
+    });
+    stick.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== stickPointerId) return;
+      e.preventDefault();
+      stickSetFromEvent(e);
+    });
+    const stickUp = (e) => {
+      if (e.pointerId !== stickPointerId) return;
+      heldPointers.delete(e.pointerId);
+      stickRelease();
+    };
+    stick.addEventListener('pointerup', stickUp);
+    stick.addEventListener('pointercancel', stickUp);
+    stick.addEventListener('lostpointercapture', stickUp);
+    stick.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Right action cluster: brakes, pedal, pump.
+    const cluster = document.createElement('div');
+    cluster.className = 'tk-cluster';
+    const mkBtn = (label, sub, cls) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tk-btn' + (cls ? ' ' + cls : '');
+      b.tabIndex = -1;
+      const s = document.createElement('span');
+      s.textContent = label;
+      b.appendChild(s);
+      if (sub) { const sm = document.createElement('small'); sm.textContent = sub; b.appendChild(sm); }
+      cluster.appendChild(b);
+      return b;
+    };
+    bindHoldButton(mkBtn('F-BRK', 'front', 'hot'), (v) => { touch.brakeF = v; });
+    bindHoldButton(mkBtn('R-BRK', 'rear', 'hot'), (v) => { touch.brakeR = v; });
+    bindHoldButton(mkBtn('PEDAL', 'sprint', 'acc'), (v) => { touch.pedal = v; });
+    bindHoldButton(mkBtn('PUMP', 'hold·let go', 'acc'), (v) => { touch.pump = v; });
+    root.appendChild(cluster);
+
+    // Mini row above the cluster: manual + air roll.
+    const miniRow = document.createElement('div');
+    miniRow.className = 'tk-mini-row';
+    const mkMini = (label) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tk-mini';
+      b.tabIndex = -1;
+      b.textContent = label;
+      miniRow.appendChild(b);
+      return b;
+    };
+    bindHoldButton(mkMini('MAN'), (v) => { touch.manual = v; });
+    bindHoldButton(mkMini('◀ ROLL'), (v) => { touch.rollL = v; });
+    bindHoldButton(mkMini('ROLL ▶'), (v) => { touch.rollR = v; });
+    root.appendChild(miniRow);
+
+    // System keys, top-right.
+    const sys = document.createElement('div');
+    sys.className = 'tk-sys';
+    const mkSys = (label, title) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.title = title || label;
+      b.tabIndex = -1;
+      sys.appendChild(b);
+      return b;
+    };
+    bindEdgeButton(mkSys('⏸', 'Pause'), () => { touch.pause = true; });
+    bindEdgeButton(mkSys('↺', 'Reset to checkpoint'), () => { touch.reset = true; });
+    bindEdgeButton(mkSys('📷', 'Camera'), () => { touch.cameraCycle = true; });
+    root.appendChild(sys);
+
+    (ctx && ctx.container ? ctx.container : document.body).appendChild(root);
+    touchRoot = root;
+    touchRefreshVisibility();
+  }
+
+  function onFirstTouch() { markTouchSeen(); }
+
+  buildTouchUI();
+  window.addEventListener('touchstart', onFirstTouch, { passive: true });
+  window.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch') markTouchSeen();
+  }, { passive: true });
 
   window.addEventListener('keydown', onKeyDown, { passive: false });
   window.addEventListener('keyup', onKeyUp);
@@ -162,8 +464,28 @@ export function createInput(ctx) {
       }
     }
 
-    // Gamepad axes are already analogue, so only smooth when it is keyboard-led.
-    const smoothing = padActive ? 1 : 0;
+    // ---- touch merges (same max-wins policy as gamepad) --------------------
+    const tSteer = applyDeadzone(touch.steerX || 0, DEADZONE);
+    const tPitch = applyDeadzone(touch.steerY || 0, DEADZONE);
+    const tRoll = (touch.rollR ? 1 : 0) - (touch.rollL ? 1 : 0);
+    if (Math.abs(tSteer) > Math.abs(steerT)) steerT = tSteer;
+    if (Math.abs(tPitch) > Math.abs(pitchT)) pitchT = tPitch;
+    if (Math.abs(tRoll) > Math.abs(rollT)) rollT = tRoll;
+    brakeFT = Math.max(brakeFT, touch.brakeF ? 1 : 0);
+    brakeRT = Math.max(brakeRT, touch.brakeR ? 1 : 0);
+    pedalT = Math.max(pedalT, touch.pedal ? 1 : 0);
+    pumpT = Math.max(pumpT, touch.pump ? 1 : 0);
+    manual = manual || touch.manual;
+    if (touch.reset) { reset = true; touch.reset = false; }
+    if (touch.pause) { pause = true; touch.pause = false; }
+    if (touch.cameraCycle) { cameraCycle = true; touch.cameraCycle = false; }
+    if (touch.photoMode) { photoMode = true; touch.photoMode = false; }
+    const touchActive = touch.active ||
+      Math.abs(tSteer) > 0 || Math.abs(tPitch) > 0 || tRoll !== 0 ||
+      brakeFT > 0 || brakeRT > 0 || pedalT > 0 || pumpT > 0 || !!manual;
+
+    // Gamepad/touch axes are already analogue, so only smooth when keyboard-led.
+    const smoothing = (padActive || touchActive) ? 1 : 0;
     const rate = (target, current, attack, release) => {
       if (smoothing) return target;
       const r = Math.abs(target) > Math.abs(current) ? attack : release;
@@ -184,7 +506,7 @@ export function createInput(ctx) {
     state.pause = pause;
     state.cameraCycle = cameraCycle;
     state.photoMode = photoMode;
-    state.anyPressed = anyKeyboard || padActive;
+    state.anyPressed = anyKeyboard || padActive || touchActive;
 
     pressedEdge.clear();
   }
@@ -212,6 +534,8 @@ export function createInput(ctx) {
 
     get hasGamepad() { return gamepadIndex >= 0; },
     get lastGamepadActivity() { return lastGamepadActivity; },
+    get isTouch() { return touchShouldShow(); },
+    get touchActive() { return touch.active; },
 
     dispose() {
       window.removeEventListener('keydown', onKeyDown);
@@ -219,6 +543,11 @@ export function createInput(ctx) {
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('gamepadconnected', onGamepadConnected);
       window.removeEventListener('gamepaddisconnected', onGamepadDisconnected);
+      window.removeEventListener('touchstart', onFirstTouch);
+      if (touchRoot && touchRoot.parentNode) touchRoot.parentNode.removeChild(touchRoot);
+      const st = document.getElementById('dsc-touch-style');
+      if (st && st.parentNode) st.parentNode.removeChild(st);
+      touchRoot = null;
     },
   };
 }
